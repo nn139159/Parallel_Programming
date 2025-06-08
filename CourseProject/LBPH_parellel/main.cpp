@@ -7,7 +7,7 @@ int main(int, char**) {
     using namespace std::chrono;
 
     // std::string datasetPath = "../att_faces";
-    std::string datasetPath = "../extendedyaleb_cropped_full";
+    std::string datasetPath = "../../extendedyaleb_cropped_full";
     // ---------------- [1] Dataset Loading ----------------
     auto t0 = high_resolution_clock::now();
 
