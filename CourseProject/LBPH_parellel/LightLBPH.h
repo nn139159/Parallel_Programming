@@ -11,6 +11,11 @@
 
 constexpr double PI = 3.14159265358979323846;
 
+struct LBPH_OpenMP_Params {
+    int numThreads = 4;
+    bool useSIMD = true;
+};
+
 class LBPH {
 private:
     int _grid_x;
@@ -18,7 +23,8 @@ private:
     int _radius;
     int _neighbors;
     double _threshold;
-
+    int _numThreads = 4;
+    bool _useSIMD = true;
     std::vector<Image<float>> _histograms;
     std::vector<int> _labels;
 
@@ -52,4 +58,6 @@ public:
 
     const std::vector<Image<float>>& getHistograms() const;
     const std::vector<int>& getLabels() const;
+
+    void setParameters(std::shared_ptr<LBPH_OpenMP_Params> params);
 };

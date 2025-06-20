@@ -17,6 +17,7 @@ using Clock = std::chrono::high_resolution_clock;
 LBPH::LBPH(int radius, int neighbors, int gridx, int gridy, double threshold)
     : _grid_x(gridx), _grid_y(gridy), _radius(radius), _neighbors(neighbors), _threshold(threshold) 
 {
+    std::cout << "LBPH_OpenMP Init::";
 #if defined(__AVX2__)
     std::cout << "Using AVX2" << std::endl;
 #elif defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -24,7 +25,6 @@ LBPH::LBPH(int radius, int neighbors, int gridx, int gridy, double threshold)
 #else
     std::cout << "No SIMD extensions" << std::endl;
 #endif
-
 }
 
 // Initializes and computes this LBPH Model. The current implementation is
@@ -34,6 +34,14 @@ LBPH::LBPH(int radius, int neighbors, int gridx, int gridy, double threshold)
 // (grid_x=8), (grid_y=8) controls the grid size of the spatial histograms.
 LBPH::LBPH(const std::vector<Image<uint8_t>>& src, const std::vector<int>& labels, int radius, int neighbors, int gridx, int gridy, double threshold)
     : _grid_x(gridx), _grid_y(gridy), _radius(radius), _neighbors(neighbors), _threshold(threshold) {
+    std::cout << "LBPH_OpenMP Init";
+#if defined(__AVX2__)
+    std::cout << "Using AVX2" << std::endl;
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    std::cout << "Using ARM NEON" << std::endl;
+#else
+    std::cout << "No SIMD extensions" << std::endl;
+#endif
     train(src, labels);
 }
 
@@ -42,12 +50,30 @@ LBPH::~LBPH() {}
 // Computes a LBPH model with images in src and
 // corresponding labels in labels.
 void LBPH::train(const std::vector<Image<uint8_t>>& images, const std::vector<int>& labels) {
+    std::cout << "----- LBPH_OpenMP Train -----\n";
+    if (_useSIMD) {
+        std::cout << "SIMD enabled" << std::endl;
+    } else {
+        std::cout << "SIMD not enabled" << std::endl;
+    }
+    omp_set_num_threads(_numThreads);
+    std::cout << "Number of cores used: " << omp_get_max_threads() << "\n";
+
     train(images, labels, false);
 }
 
 // Updates this LBPH model with images in src and
 // corresponding labels in labels.
 void LBPH::update(const std::vector<Image<uint8_t>>& images, const std::vector<int>& labels) {
+    std::cout << "----- LBPH_OpenMP Update -----\n";
+    if (_useSIMD) {
+        std::cout << "SIMD enabled" << std::endl;
+    } else {
+        std::cout << "SIMD not enabled" << std::endl;
+    }
+    omp_set_num_threads(_numThreads);
+    std::cout << " Number of cores used: " << omp_get_max_threads() << "\n";
+
     train(images, labels, true);
 }
 
@@ -105,6 +131,204 @@ void olbp_(const Image<_Tp>& src, Image<_Tp>& dst) {
 //------------------------------------------------------------------------------
 // cv::elbp
 //------------------------------------------------------------------------------
+#if defined(__AVX2__)
+inline __m256 _mm256_abs_ps(__m256 x) {
+    __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    return _mm256_and_ps(x, sign_mask);
+}
+template <typename _Tp> static
+void elbp_avx2(const Image<_Tp>& src, Image<int>& dst, int, int) {
+    const int radius = 1;
+    const int neighbors = 8;
+    dst = Image<int>(src.rows - 2 * radius, src.cols - 2 * radius);
+
+    // Precompute all offsets and weights
+    int fx[8], fy[8], cx[8], cy[8];
+    float w1[8], w2[8], w3[8], w4[8];
+    for (int n = 0; n < neighbors; ++n) {
+        float x = radius * cos(2.0f * PI * n / neighbors);
+        float y = -radius * sin(2.0f * PI * n / neighbors);
+        fx[n] = static_cast<int>(floor(x));
+        fy[n] = static_cast<int>(floor(y));
+        cx[n] = static_cast<int>(ceil(x));
+        cy[n] = static_cast<int>(ceil(y));
+        float tx = x - fx[n];
+        float ty = y - fy[n];
+        w1[n] = (1 - tx) * (1 - ty);
+        w2[n] = tx * (1 - ty);
+        w3[n] = (1 - tx) * ty;
+        w4[n] = tx * ty;
+    }
+
+    const float epsilon = std::numeric_limits<float>::epsilon();
+
+    #pragma omp parallel for
+    for (int i = radius; i < src.rows - radius; ++i) {
+        for (int j = radius; j <= src.cols - radius - 8; j += 8) {
+            __m256 center = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&src.at(i, j)))
+            ));
+
+            int code[8] = {0};
+            for (int n = 0; n < neighbors; ++n) {
+                __m256 w1v = _mm256_set1_ps(w1[n]);
+                __m256 w2v = _mm256_set1_ps(w2[n]);
+                __m256 w3v = _mm256_set1_ps(w3[n]);
+                __m256 w4v = _mm256_set1_ps(w4[n]);
+
+                __m128i n1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&src.at(i + fy[n], j + fx[n])));
+                __m128i n2 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&src.at(i + fy[n], j + cx[n])));
+                __m128i n3 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&src.at(i + cy[n], j + fx[n])));
+                __m128i n4 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&src.at(i + cy[n], j + cx[n])));
+
+                __m256 p1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(n1));
+                __m256 p2 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(n2));
+                __m256 p3 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(n3));
+                __m256 p4 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(n4));
+
+                __m256 interp = _mm256_add_ps(
+                    _mm256_add_ps(_mm256_mul_ps(w1v, p1), _mm256_mul_ps(w2v, p2)),
+                    _mm256_add_ps(_mm256_mul_ps(w3v, p3), _mm256_mul_ps(w4v, p4))
+                );
+
+                // (t > center) || (abs(t - center) < eps)
+                __m256 gt = _mm256_cmp_ps(interp, center, _CMP_GT_OQ);
+                __m256 eq = _mm256_cmp_ps(_mm256_abs_ps(_mm256_sub_ps(interp, center)), _mm256_set1_ps(epsilon), _CMP_LT_OQ);
+                __m256 mask = _mm256_or_ps(gt, eq);
+
+                __m256i bits = _mm256_castps_si256(mask);
+                __m256i shift = _mm256_set1_epi32(1 << n);
+                __m256i contrib = _mm256_and_si256(bits, shift);
+
+                alignas(32) int temp[8];
+                _mm256_store_si256(reinterpret_cast<__m256i*>(temp), contrib);
+
+                for (int k = 0; k < 8; ++k) code[k] |= temp[k];
+            }
+
+            for (int k = 0; k < 8; ++k)
+                dst.at(i - radius, j - radius + k) = code[k];
+        }
+
+        // tail loop
+        for (int j = ((src.cols - radius - 1) & ~7); j < src.cols - radius; ++j) {
+            float center = static_cast<float>(src.at(i, j));
+            int code = 0;
+            for (int n = 0; n < neighbors; ++n) {
+                float t =
+                    w1[n] * src.at(i + fy[n], j + fx[n]) +
+                    w2[n] * src.at(i + fy[n], j + cx[n]) +
+                    w3[n] * src.at(i + cy[n], j + fx[n]) +
+                    w4[n] * src.at(i + cy[n], j + cx[n]);
+                if (t > center || std::abs(t - center) < epsilon)
+                    code |= (1 << n);
+            }
+            dst.at(i - radius, j - radius) = code;
+        }
+    }
+}
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+template <typename _Tp>
+void elbp_neon(const Image<_Tp>& src, Image<int>& dst, int, int) {
+    static_assert(std::is_same<_Tp, uint8_t>::value, "Only uint8_t supported in neon version");
+
+    const int radius = 1;
+    const int neighbors = 8;
+    dst = Image<int>(src.rows - 2 * radius, src.cols - 2 * radius);
+
+    // Precompute offsets and weights
+    int fx[8], fy[8], cx[8], cy[8];
+    float w1[8], w2[8], w3[8], w4[8];
+    for (int n = 0; n < neighbors; ++n) {
+        float x = radius * std::cos(2.0f * PI * n / neighbors);
+        float y = -radius * std::sin(2.0f * PI * n / neighbors);
+        fx[n] = static_cast<int>(std::floor(x));
+        fy[n] = static_cast<int>(std::floor(y));
+        cx[n] = static_cast<int>(std::ceil(x));
+        cy[n] = static_cast<int>(std::ceil(y));
+        float tx = x - fx[n];
+        float ty = y - fy[n];
+        w1[n] = (1 - tx) * (1 - ty);
+        w2[n] = tx * (1 - ty);
+        w3[n] = (1 - tx) * ty;
+        w4[n] = tx * ty;
+    }
+
+    const float epsilon = std::numeric_limits<float>::epsilon();
+    float32x4_t v_epsilon = vdupq_n_f32(epsilon);
+
+    #pragma omp parallel for
+    for (int i = radius; i < src.rows - radius; ++i) {
+        for (int j = radius; j <= src.cols - radius - 8; j += 8) {
+            uint8x8_t center_u8 = vld1_u8(&src.at(i, j));
+            uint16x8_t center_u16 = vmovl_u8(center_u8);
+            float32x4_t center_low = vcvtq_f32_u32(vmovl_u16(vget_low_u16(center_u16)));
+            float32x4_t center_high = vcvtq_f32_u32(vmovl_u16(vget_high_u16(center_u16)));
+
+            int code[8] = {0};
+
+            for (int n = 0; n < neighbors; ++n) {
+                float32x4_t vw1 = vdupq_n_f32(w1[n]);
+                float32x4_t vw2 = vdupq_n_f32(w2[n]);
+                float32x4_t vw3 = vdupq_n_f32(w3[n]);
+                float32x4_t vw4 = vdupq_n_f32(w4[n]);
+
+                // Low part (0–3)
+                uint8x8_t p1 = vld1_u8(&src.at(i + fy[n], j + fx[n]));
+                uint8x8_t p2 = vld1_u8(&src.at(i + fy[n], j + cx[n]));
+                uint8x8_t p3 = vld1_u8(&src.at(i + cy[n], j + fx[n]));
+                uint8x8_t p4 = vld1_u8(&src.at(i + cy[n], j + cx[n]));
+
+                float32x4_t interp_low = vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(p1)))), vw1);
+                interp_low = vmlaq_f32(interp_low, vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(p2)))), vw2);
+                interp_low = vmlaq_f32(interp_low, vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(p3)))), vw3);
+                interp_low = vmlaq_f32(interp_low, vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(p4)))), vw4);
+
+                float32x4_t diff_low = vsubq_f32(interp_low, center_low);
+                uint32x4_t mask_low = vorrq_u32(
+                    vcgtq_f32(interp_low, center_low),
+                    vcltq_f32(vabsq_f32(diff_low), v_epsilon)
+                );
+                for (int k = 0; k < 4; ++k)
+                    if (vgetq_lane_u32(mask_low, k)) code[k] |= (1 << n);
+
+                // High part (4–7)
+                float32x4_t interp_high = vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(vmovl_u8(p1)))), vw1);
+                interp_high = vmlaq_f32(interp_high, vcvtq_f32_u32(vmovl_u16(vget_high_u16(vmovl_u8(p2)))), vw2);
+                interp_high = vmlaq_f32(interp_high, vcvtq_f32_u32(vmovl_u16(vget_high_u16(vmovl_u8(p3)))), vw3);
+                interp_high = vmlaq_f32(interp_high, vcvtq_f32_u32(vmovl_u16(vget_high_u16(vmovl_u8(p4)))), vw4);
+
+                float32x4_t diff_high = vsubq_f32(interp_high, center_high);
+                uint32x4_t mask_high = vorrq_u32(
+                    vcgtq_f32(interp_high, center_high),
+                    vcltq_f32(vabsq_f32(diff_high), v_epsilon)
+                );
+                for (int k = 0; k < 4; ++k)
+                    if (vgetq_lane_u32(mask_high, k)) code[4 + k] |= (1 << n);
+            }
+
+            for (int k = 0; k < 8; ++k)
+                dst.at(i - radius, j - radius + k) = code[k];
+        }
+
+        // tail loop
+        for (int j = ((src.cols - radius - 1) & ~7); j < src.cols - radius; ++j) {
+            float center = static_cast<float>(src.at(i, j));
+            int code = 0;
+            for (int n = 0; n < neighbors; ++n) {
+                float t =
+                    w1[n] * src.at(i + fy[n], j + fx[n]) +
+                    w2[n] * src.at(i + fy[n], j + cx[n]) +
+                    w3[n] * src.at(i + cy[n], j + fx[n]) +
+                    w4[n] * src.at(i + cy[n], j + cx[n]);
+                if (t > center || std::abs(t - center) < epsilon)
+                    code |= (1 << n);
+            }
+            dst.at(i - radius, j - radius) = code;
+        }
+    }
+}
+#endif
 template <typename _Tp> static
 inline void elbp_(const Image<_Tp>& src, Image<int>& dst, int radius, int neighbors) {
     dst = Image<int>(src.rows - 2 * radius, src.cols - 2 * radius);
@@ -128,7 +352,6 @@ inline void elbp_(const Image<_Tp>& src, Image<int>& dst, int radius, int neighb
         float w4 = tx * ty;
         
         // iterate through data
-        #pragma omp parallel for collapse(2)
         for (int i = radius; i < src.rows - radius; i++) {
             for (int j = radius; j < src.cols - radius; j++) {
                 // calculate interpolated value
@@ -150,7 +373,13 @@ inline void elbp_(const Image<_Tp>& src, Image<int>& dst, int radius, int neighb
 
 template <typename T>
 void elbp(const Image<T>& src, Image<int>& dst, int radius, int neighbors) {
+#if defined(__AVX2__)
+    elbp_avx2<T>(src, dst, radius, neighbors);
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    elbp_neon<T>(src, dst, radius, neighbors);
+#else
     elbp_<T>(src, dst, radius, neighbors);
+#endif
 }
 
 template <typename T>
@@ -225,14 +454,18 @@ Image<float> spatial_histogram(const Image<T>& src, int numPatterns,
 // wrapper to cv::elbp (extended local binary patterns)
 //------------------------------------------------------------------------------
 template <typename T>
-Image<int> elbp(const Image<T>& src, int radius, int neighbors) {
+Image<int> elbp(const Image<T>& src, int radius, int neighbors, bool useSIMD) {
     // Create output Image<int>
     Image<int> dst(src.rows - 2 * radius, src.cols - 2 * radius);
     // Clear
     std::fill(dst.data.begin(), dst.data.end(), 0); 
 
     // Call the actual elbp algorithm
-    elbp_<T>(src, dst, radius, neighbors);
+    if (radius == 1 && neighbors == 8 && std::is_same<T, uint8_t>::value && useSIMD) {
+        elbp<T>(src, dst, radius, neighbors);
+    } else {
+        elbp_<T>(src, dst, radius, neighbors);
+    }
 
     return dst;
 }
@@ -307,7 +540,7 @@ double compareHist_neon(const Image<float>& H1, const Image<float>& H2) {
 
     return static_cast<double>(sum);
 }
-#else
+#endif 
 double compareHist_(const Image<float>& H1, const Image<float>& H2) {
     if (H1.rows != 1 || H2.rows != 1 || H1.cols != H2.cols)
         throw std::invalid_argument("Histograms must be 1-row float Mats of same size.");
@@ -324,9 +557,10 @@ double compareHist_(const Image<float>& H1, const Image<float>& H2) {
 
     return dist;
 }
-#endif 
 
-double compareHist(const Image<float>& H1, const Image<float>& H2) {
+double compareHist_OMP(const Image<float>& H1, const Image<float>& H2, bool useSIMD) {
+    if (!useSIMD) return compareHist_(H1, H2);
+    
 #if defined(__AVX2__)
     return compareHist_avx2(H1, H2);
 #elif defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -359,12 +593,13 @@ void LBPH::train(const std::vector<Image<uint8_t>>& src, const std::vector<int>&
 
     double total_elbp_time = 0.0;
     double total_hist_time = 0.0;
-
+    std::vector<Image<float>> local_histograms(src.size());
     // store the spatial histograms of the original data
+    #pragma omp parallel for num_threads(_numThreads) reduction(+:total_elbp_time, total_hist_time)
     for (size_t sampleIdx = 0; sampleIdx < src.size(); sampleIdx++) {
         // calculate lbp image
         auto t1 = Clock::now();
-        Image<int> lbp = elbp(src[sampleIdx], _radius, _neighbors);
+        Image<int> lbp = elbp(src[sampleIdx], _radius, _neighbors, _useSIMD);
         
         auto t2 = Clock::now();
         Image<float> hist = spatial_histogram(
@@ -376,11 +611,12 @@ void LBPH::train(const std::vector<Image<uint8_t>>& src, const std::vector<int>&
         );
         auto t3 = Clock::now();
         // add to templates
-        _histograms.push_back(hist);
+        //_histograms.push_back(hist);
+        local_histograms[sampleIdx] = hist;
         total_elbp_time += std::chrono::duration<double, std::milli>(t2 - t1).count();
         total_hist_time += std::chrono::duration<double, std::milli>(t3 - t2).count();
     }
-
+    _histograms.insert(_histograms.end(), local_histograms.begin(), local_histograms.end());
     double avg_elbp = total_elbp_time / src.size();
     double avg_hist = total_hist_time / src.size();
     std::cout << "[train] Number of images: " << src.size() << "\n";
@@ -399,7 +635,7 @@ void LBPH::predict(const Image<uint8_t>& src, NearestNeighborCollector& collecto
     }
 
     // get the spatial histogram from input image
-    Image<int> lbp_image = elbp(src, _radius, _neighbors);
+    Image<int> lbp_image = elbp(src, _radius, _neighbors, _useSIMD);
 
     Image<float> query = spatial_histogram(
         lbp_image,
@@ -413,7 +649,7 @@ void LBPH::predict(const Image<uint8_t>& src, NearestNeighborCollector& collecto
 
     #pragma omp parallel for
     for (int i = 0; i < static_cast<int>(_histograms.size()); i++) {
-        double dist = compareHist(_histograms[i], query);
+        double dist = compareHist_OMP(_histograms[i], query, _useSIMD);
         int label = _labels[i];
         results[i] = { dist, label };
     }
@@ -430,4 +666,14 @@ void LBPH::predict(const Image<uint8_t>& src, int& label, double& confidence) co
     predict(src, collector);
     label = collector.getLabel();
     confidence = collector.getDistance();
+}
+
+void LBPH::setParameters(std::shared_ptr<LBPH_OpenMP_Params> params) {
+    auto p = std::dynamic_pointer_cast<LBPH_OpenMP_Params>(params);
+    if (p) {
+        _numThreads = p->numThreads;
+        _useSIMD = p->useSIMD;
+    } else {
+        throw std::invalid_argument("Invalid parameter type for LBPH_OpenMP");
+    }
 }

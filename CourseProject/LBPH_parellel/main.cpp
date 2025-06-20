@@ -6,15 +6,15 @@
 int main(int, char**) {
     using namespace std::chrono;
 
-    // std::string datasetPath = "../att_faces";
-    std::string datasetPath = "../../extendedyaleb_cropped_full";
+    std::string datasetPath = "../../att_faces";
+    // std::string datasetPath = "../../extendedyaleb_cropped_full";
     // ---------------- [1] Dataset Loading ----------------
     auto t0 = high_resolution_clock::now();
 
     std::vector<Image<uint8_t>> color_faces;
     std::vector<int> labels;
-    // loadATNTDataset_stb(datasetPath, color_faces, labels, 3);
-    loadExtendedYaleFaces_stb(datasetPath, color_faces, labels, 3);
+    loadATNTDataset_stb(datasetPath, color_faces, labels, 3);
+    // loadExtendedYaleFaces_stb(datasetPath, color_faces, labels, 3);
 
     auto t1 = high_resolution_clock::now();
     if (color_faces.empty()) {
